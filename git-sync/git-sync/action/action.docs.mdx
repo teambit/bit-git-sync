@@ -1,0 +1,49 @@
+---
+labels: ['GitHub Action', 'CI', 'module']
+description: 'Entry point for the bit-git-sync GitHub Action.'
+---
+
+Normalizes the current GitHub Actions event into a `bit ci` command via
+`routeEvent` (`@bitdev/git-sync.git-sync.event-router`), configures the git
+identity used for any commits the sync makes, and runs the routed command.
+
+`runAction` takes its environment, event-file reader, and process executor as
+injected dependencies so it is unit-testable without a real GitHub Actions
+runner:
+
+```ts
+import { readFileSync } from 'node:fs';
+import { runAction } from '@bitdev/git-sync.git-sync.action';
+
+const exitCode = await runAction({
+  env: process.env,
+  readEventFile: (path) => JSON.parse(readFileSync(path, 'utf8')),
+  readTextFile: (path) => readFileSync(path, 'utf8'),
+  exec: (cmd, args) => spawnAndWaitForExitCode(cmd, args),
+});
+```
+
+`readTextFile` is optional and used for exactly one thing: reading
+`<ws-dir>/workspace.jsonc` to extract `defaultScope`, which is passed to the
+event-router as `repoScope` for the Stage 0 cross-scope-lane relevance filter
+(see `@bitdev/git-sync.git-sync.event-router`'s docs). It's a tolerant regex
+extraction rather than a JSON(C) parse, since `workspace.jsonc` routinely
+contains comments that would make `JSON.parse` throw. Omitting it, or its
+throwing on a missing file, both leave `repoScope` `undefined` — which fails
+**open** (the filter doesn't skip anything; the CLI's own cross-scope halt
+remains the real safety net).
+
+## Entry points
+
+This component has two, and the distinction matters:
+
+- **`index.ts`** — the component's `mainFile` and its public surface. It
+  exports `runAction` and `ActionDeps` and **nothing else**: importing it has
+  no side effects, which is what makes the snippet above safe.
+- **`run.ts`** — the executable. It invokes `runAction` on import, wiring it to
+  the real `process.env`, `fs.readFileSync`, `process.chdir`, and a real
+  child-process spawn, then sets `process.exitCode` to the result. This is the
+  file `scripts/bundle-action.mjs` bundles into `dist/index.js`, which
+  `action.yml` declares as the action's `main`.
+
+Do not import `run.ts` from library code — it will run the action.

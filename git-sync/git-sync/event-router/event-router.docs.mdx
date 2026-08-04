@@ -1,0 +1,154 @@
+---
+labels: ['event-router', 'github-actions', 'ci']
+description: 'Maps a normalized GitHub Actions event into the `bit ci` command that should run in response.'
+---
+
+`routeEvent` is a single pure function: it takes a normalized description of the
+GitHub event that triggered the workflow (event name, `repository_dispatch`
+type, push ref, pull request state, etc.) and decides which `bit ci <...args>`
+command to run — or that the event should be skipped entirely (for example,
+pushes made by bit-sync's own commits, which are marked with the
+`[bit-sync]` trailer to avoid re-triggering a sync loop).
+
+### Routing a bit.cloud export webhook
+
+bit.cloud's export webhook delivers a `repository_dispatch` event with
+`dispatchType: 'bit-export'`. The lane is exported when
+`clientPayload.laneId` is a non-empty `'scope-id/lane-name'` string; an empty
+(or absent) `laneId` means the export was to main. The full, scope-qualified
+`laneId` is passed through to the `bit ci sync` argv unsplit — the hosting
+scope may differ from this repo's `defaultScope` (see "Cross-scope lanes"
+below), so the CLI needs it too.
+
+```ts
+import { routeEvent } from './event-router.js';
+
+const base = { defaultBranch: 'main', mainSyncBranch: 'bit-sync/main' };
+
+routeEvent({
+  ...base,
+  eventName: 'repository_dispatch',
+  dispatchType: 'bit-export',
+  clientPayload: { laneId: 'acme.shop/probe-lane' },
+});
+// => { kind: 'run', args: ['sync', 'acme.shop/probe-lane'] }
+
+routeEvent({
+  ...base,
+  eventName: 'repository_dispatch',
+  dispatchType: 'bit-export',
+  clientPayload: { laneId: '' },
+});
+// => { kind: 'run', args: ['sync', '--main'] }
+```
+
+### Cross-scope lanes: skipping exports irrelevant to this repo's scope
+
+A lane is *hosted* on one scope but may *contain* components from many. When
+`clientPayload.componentIds` (a comma-separated `scope/name@version` list) is
+present and `repoScope` is set, a `bit-export` dispatch whose components don't
+touch `repoScope` at all is skipped as irrelevant — before the `laneId` is
+even looked at. Either input being absent fails **open** (routes as before):
+the CLI's own cross-scope halt is the actual safety net, not this filter.
+
+```ts
+import { routeEvent } from './event-router.js';
+
+const base = { defaultBranch: 'main', mainSyncBranch: 'bit-sync/main' };
+
+routeEvent({
+  ...base,
+  eventName: 'repository_dispatch',
+  dispatchType: 'bit-export',
+  repoScope: 'acme.cards',
+  clientPayload: {
+    laneId: 'acme.cards/cross-scope',
+    componentIds: 'acme.shop/bar@2.0.0',
+  },
+});
+// => { kind: 'skip', reason: "lane does not touch this repo's scope (acme.cards)" }
+```
+
+### Skipping pushes produced by bit-sync itself
+
+Pushes to the default branch, to the main-sync branch, or that carry the
+`[bit-sync]` commit marker are skipped so the workflow doesn't re-trigger on
+its own output.
+
+```ts
+import { routeEvent } from './event-router.js';
+
+const base = { defaultBranch: 'main', mainSyncBranch: 'bit-sync/main' };
+
+routeEvent({
+  ...base,
+  eventName: 'push',
+  ref: 'refs/heads/feature-x',
+  headCommitMessage: 'chore(bit-sync): x\n\n[bit-sync]',
+});
+// => { kind: 'skip', reason: 'push is one of bit-sync own commits' }
+
+routeEvent({
+  ...base,
+  eventName: 'push',
+  ref: 'refs/heads/feature-x',
+  headCommitMessage: 'wip',
+});
+// => { kind: 'run', args: ['sync', '--branch', 'feature-x'] }
+```
+
+### Lane names are validated before they reach the argv
+
+A lane name arrives from somewhere outside this repository — a bit.cloud
+webhook's `client_payload`, or free text typed into a `workflow_dispatch`
+form — and is then spliced into the `bit ci` argument vector. A name starting
+with `-` would be read by `bit` as a **flag** rather than a positional
+argument, so a lane called `--all` would silently turn a single-lane sync into
+a full reconcile. Lane names must therefore match `^[A-Za-z0-9._-]+$` and must
+not begin with `-`; anything else is skipped rather than passed through.
+
+For the `bit-export` webhook contract, the `laneId` is scope-qualified
+(`scope-id/lane-name`) and passed through to argv as a single string, so its
+scope segment and name segment are validated **independently** against that
+same rule before the string is spliced in — `'--evil/lane'` is rejected on
+its scope segment just as readily as `'scope/--evil'` is on its name segment.
+
+```ts
+import { routeEvent } from './event-router.js';
+
+const base = { defaultBranch: 'main', mainSyncBranch: 'bit-sync/main' };
+
+routeEvent({
+  ...base,
+  eventName: 'repository_dispatch',
+  dispatchType: 'bit-export',
+  clientPayload: { laneId: 'scope/--all' },
+});
+// => { kind: 'skip', reason: 'invalid lane name from client_payload.laneId: "--all"' }
+```
+
+### Routing a merged pull request and a scheduled reconcile
+
+A merged, non-main-sync pull request maps to `bit ci merge`; a `schedule`
+event (cron reconcile) maps to `bit ci sync --all`.
+
+`baseRef` (the branch the PR merged **into**) gates the release: `bit ci
+merge` releases from the default branch, so a stacked PR that landed on some
+other feature branch has not reached the default branch yet and must not
+release. An absent `baseRef` means the caller could not determine the base and
+is treated permissively.
+
+```ts
+import { routeEvent } from './event-router.js';
+
+const base = { defaultBranch: 'main', mainSyncBranch: 'bit-sync/main' };
+
+routeEvent({ ...base, eventName: 'pull_request', prMerged: true, prHeadRef: 'feature-x', baseRef: 'main' });
+// => { kind: 'run', args: ['merge'] }
+
+routeEvent({ ...base, eventName: 'pull_request', prMerged: true, prHeadRef: 'part-2', baseRef: 'feature-x' });
+// => { kind: 'skip', reason: "merged PR targets 'feature-x', not the default branch 'main'" }
+
+routeEvent({ ...base, eventName: 'schedule' });
+// => { kind: 'run', args: ['sync', '--all'] }
+```

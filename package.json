@@ -1,0 +1,7 @@
+{
+  "type": "module",
+  "scripts": {
+    "bundle": "node scripts/bundle-action.mjs",
+    "verify-bundle": "node scripts/verify-bundle.mjs"
+  }
+}

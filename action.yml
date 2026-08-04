@@ -1,0 +1,26 @@
+name: bit-git-sync
+description: Bi-directional sync between Bit lanes and GitHub branches/pull requests
+author: bit-git-sync
+branding:
+  icon: refresh-cw
+  color: purple
+inputs:
+  ws-dir:
+    description: >-
+      Directory of the Bit workspace, relative to the repository root. The
+      action chdirs here before running any command. Leave as '.' when
+      workspace.jsonc sits at the repository root.
+    required: false
+    default: '.'
+  main-sync-branch:
+    description: >-
+      Branch used for main-scope sync PRs. Must match
+      `teambit.git/ci`.`sync.mainSyncBranch` in your workspace.jsonc.
+    required: false
+    default: bit-sync/main
+runs:
+  using: node20
+  # Committed esbuild bundle -- see scripts/bundle-action.mjs. Must be ESM
+  # (the root package.json is `"type": "module"`); `npm run verify-bundle`
+  # asserts it is both fresh and loadable.
+  main: dist/index.js

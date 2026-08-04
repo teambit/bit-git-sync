@@ -1,0 +1,333 @@
+---
+labels: ['workflows', 'github-actions', 'ci', 'setup-guide']
+description: 'Shippable GitHub Actions workflow templates for bit-git-sync, plus the customer setup guide (bit.cloud webhook wiring, secrets, sync config, conflict runbook).'
+---
+
+This component ships the two GitHub Actions workflow YAML templates that
+drive bit-git-sync (`templates/bit-sync.yml`, `templates/bit-release.yml`),
+and this page is the **customer-facing setup guide**: what to copy where,
+which secrets to create, how to wire the bit.cloud webhook, how to configure
+`teambit.git/ci`'s `sync` block, and what to do when a sync halts on a
+conflict.
+
+```ts
+import { TEMPLATE_FILES, REPOSITORY_DISPATCH_EVENT_TYPES, WEBHOOK_PAYLOAD_TEMPLATE } from '@bitdev/git-sync.git-sync.workflows';
+```
+
+## 1. Copy the workflow templates into your repository
+
+Copy both files from this component's `templates/` directory into your
+repository's `.github/workflows/`, **then review the lines marked
+`CHANGE-ME`** — the templates are not drop-in unchanged, they carry
+placeholders for your repository's default branch and for the published
+location of the action:
+
+- `templates/bit-sync.yml` &rarr; `.github/workflows/bit-sync.yml` — reacts to
+  bit.cloud export webhooks, plain `git push`, a 30-minute scheduled
+  reconcile, and manual `workflow_dispatch`.
+- `templates/bit-release.yml` &rarr; `.github/workflows/bit-release.yml` —
+  reacts to merged pull requests and triggers `bit ci merge`.
+
+Every `CHANGE-ME` marker is one of these:
+
+| What | Where | Default shipped |
+| --- | --- | --- |
+| Your repository's **default branch** | `bit-sync.yml`'s `push.branches-ignore`, `bit-release.yml`'s `pull_request.branches` | `main` |
+| Where **you** publish this action | the `uses:` line in both templates | `acme/bit-git-sync@v1` (a placeholder pointing at this workspace's own repo path — **replace it**, and pin to a release tag or commit SHA) |
+| Your `sync.mainSyncBranch` | the `main-sync-branch` input in both templates, plus `bit-release.yml`'s `if:` guard | `bit-sync/main` |
+
+## 2. Create the required secrets
+
+Two of these are **repository secrets**; the third is a credential you paste
+into bit.cloud and never store in GitHub. They are three distinct
+credentials — see the note under the table.
+
+| Secret | Where it lives | Purpose |
+| --- | --- | --- |
+| `BIT_CONFIG_ACCESS_TOKEN` | GitHub repo secret | bit.cloud service-account token used to read/write the scope during sync. **In Mode A (the only implemented mode today, `git-source-of-truth`) this service account must be exempt from your org's change-request/merge block** — otherwise bit.cloud rejects the writes the sync makes on the account's behalf. |
+| `BIT_SYNC_GH_TOKEN` | GitHub repo secret | A GitHub PAT or GitHub App installation token with `repo` scope, used by the workflow itself for `actions/checkout` and for the pushes the sync makes. **Pushes authenticated with the default `GITHUB_TOKEN` do not trigger other workflow runs** — if you need the sync PR's branch to run your own CI checks, you must push with a PAT/App token instead. Both templates fall back to `secrets.GITHUB_TOKEN` when this is unset, which is fine for checkout but will not re-trigger workflows on push. |
+| The webhook `Authorization` PAT | **bit.cloud webhook header** (step 3) — *not* a GitHub secret | A GitHub PAT that bit.cloud sends in the webhook's `Authorization: Bearer` header so its POST to the GitHub dispatches API is accepted. Needs only permission to create `repository_dispatch` events on the repo (`repo` scope on a classic PAT; `contents: write` on a fine-grained one). |
+
+> **These are not interchangeable.** `BIT_SYNC_GH_TOKEN` is read by the
+> workflow *from* GitHub's secret store; the webhook PAT is stored *inside
+> bit.cloud's* webhook configuration and is never visible to the workflow.
+> Storing the webhook PAT as a repo secret does nothing — bit.cloud cannot read
+> your GitHub secrets. You may of course mint one PAT and use its value in both
+> places, but they are two separate configuration entries and rotating one does
+> not rotate the other.
+
+## 2b. Workflow permissions (`GITHUB_TOKEN` scopes)
+
+Both templates declare an explicit `permissions:` block:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+```
+
+This is required, not decorative. On repositories and organizations created
+after February 2023 — and anywhere the org or repo setting is left at
+*"Read repository contents permission"* — the default `GITHUB_TOKEN` handed to
+a workflow run is **read-only**. bit-git-sync pushes sync branches (needs
+`contents: write`) and opens, updates and comments on sync PRs (needs
+`pull-requests: write`), so a run without this block fails with a `403` the
+first time it tries to write. Declaring the scopes in the workflow keeps it
+working regardless of the repository's default, and keeps the grant visible
+and minimal rather than relying on a repo-wide "read and write" default.
+
+## 3. Wire the bit.cloud webhook
+
+This is the verified, working setup (empirically confirmed against a live
+bit.cloud org) — it is what actually drives `bit-sync.yml`'s
+`repository_dispatch` trigger:
+
+1. In your bit.cloud org, go to **Settings &rarr; Webhooks &rarr; Create webhook**.
+2. **Event**: `Components &rarr; Export succeeded`.
+3. **URL**: `https://api.github.com/repos/<owner>/<repo>/dispatches`
+4. **Headers**:
+   - `Authorization: Bearer <GitHub PAT with repo scope>` — paste the PAT's
+     **value** here, into bit.cloud. This is the third credential from the
+     table in step 2, and it is *not* a GitHub repository secret:
+     `${{ secrets.* }}` means nothing in this field, and bit.cloud cannot read
+     your repository's secrets. It is also a different configuration entry from
+     `BIT_SYNC_GH_TOKEN` even if you reuse the same PAT value for both.
+   - `Accept: application/vnd.github+json`
+5. **Template**: `Custom`, with this exact payload body:
+
+```ts
+console.log(WEBHOOK_PAYLOAD_TEMPLATE);
+// {"event_type":"bit-export","client_payload":{"laneId":"{{laneId}}","componentIds":"{{componentIds}}","owner":"{{owner}}","actor":"{{username}}"}}
+```
+
+bit.cloud substitutes the `{{...}}` tokens (mustache-style) before
+delivering the request, so GitHub receives a real `repository_dispatch`
+event with `event_type: "bit-export"` and the four fields populated.
+
+### Verified facts about this webhook
+
+- Deliveries are `POST` requests with `Content-Type: application/json` and
+  carry an `x-bit-signature` header (per-webhook, so it can be used to
+  verify authenticity if you proxy the delivery instead of hitting the
+  GitHub dispatches API directly).
+- `laneId` is `<scope>/<lane>` for a **lane** export, and empty (`""`) for a
+  **main** export — that single discriminator is how one webhook covers
+  both cases. The event router (`@bitdev/git-sync.git-sync.event-router`)
+  reads it exactly this way: non-empty &rarr; `bit ci sync <lane>`, empty
+  &rarr; `bit ci sync --main`.
+- **There is no "lane removed" webhook event on bit.cloud.** Lane deletions
+  are picked up by `bit-sync.yml`'s scheduled reconcile run (`schedule: */30
+  * * * *`) instead — don't wait for a webhook that will never arrive.
+
+### Accepted `repository_dispatch` types
+
+```ts
+console.log(REPOSITORY_DISPATCH_EVENT_TYPES);
+// ['bit-export', 'bit-lane-export', 'bit-main-export', 'bit-lane-removed']
+```
+
+`'bit-export'` (above) is the real, only-verified bit.cloud contract. The
+other three (`bit-lane-export`, `bit-main-export`, `bit-lane-removed`) are
+forward-compat aliases the router also accepts, in case you (or a future
+bit.cloud platform version) wire a webhook that sends the originally-assumed,
+more granular dispatch types instead. You do not need to configure anything
+extra to get these — they're accepted automatically if a dispatch ever
+arrives with one of those `event_type` values.
+
+### Cross-scope lanes
+
+A lane is *hosted* on one scope but may *contain* components from many, so one
+lane can map to changes in multiple repositories. **v1's boundary is that a
+lane's content must be a subset of one scope** — this repo's `defaultScope`.
+When the webhook payload's `componentIds` field (included in the template
+above) is present, the action reads this repo's `defaultScope` from
+`workspace.jsonc` and skips a `bit-export` dispatch outright when none of the
+touched components belong to it — the export simply isn't this repo's
+concern, and nothing runs. When the action can't tell (`componentIds` absent,
+or `defaultScope` unreadable), it routes the export through as before, and
+`bit ci`'s own reconciler halts safely if the lane turns out to actually be
+cross-scope, naming the foreign components/scopes rather than silently
+mirroring only part of the lane or leaking foreign components into this repo.
+See "Cross-scope lanes" in the design spec
+(`docs/superpowers/specs/2026-07-29-bit-git-sync-design.md`) for the full
+model and the staged plan (Stage 0 here; scope-sliced mirroring and
+coordinated cross-repo release are designed but not yet built).
+
+## 4. Configure `teambit.git/ci`'s `sync` block
+
+Add a `sync` block under the `teambit.git/ci` aspect in your `workspace.jsonc`:
+
+```jsonc
+{
+  "teambit.git/ci": {
+    "sync": {
+      // Only implemented mode today; see "Reserved fields" below.
+      "mode": "git-source-of-truth",
+      // Lane 'my-lane' maps to branch 'lane/my-lane'.
+      "branchPrefix": "lane/",
+      // Explicit lane -> branch overrides, applied after branchPrefix.
+      "branches": { "my-lane": "custom-branch-name" },
+      // Glob patterns of lane names to sync; ['*'] (default) syncs all lanes.
+      // Set to [] to disable lane mirroring entirely (main-only sync).
+      "lanes": ["*"],
+      // Branch used for main-scope drift-reconcile PRs. Must match the `if:`
+      // guard in bit-release.yml and the `main-sync-branch` action input in
+      // both templates.
+      "mainSyncBranch": "bit-sync/main"
+    }
+  }
+}
+```
+
+Use the example above (`lanes: ['*']`) when bit.cloud is the source of
+truth for day-to-day component work and you want every lane mirrored to a
+git branch as it's edited.
+
+### Mode B example: git-as-mirror (main-only, no lane mirroring)
+
+```jsonc
+{
+  "teambit.git/ci": {
+    "sync": {
+      // NOTE: `mode` is a RESERVED no-op today -- what makes this "Mode B" is
+      // `lanes: []` below, not this line. See "Reserved fields" further down.
+      "mode": "git-source-of-truth",
+      // No branchPrefix/branches needed -- lanes are never mirrored to branches.
+      "lanes": [],
+      "mainSyncBranch": "bit-sync/main"
+    }
+  }
+}
+```
+
+Use this shape when your git repository is the **compliance mirror**: work
+happens on bit.cloud lanes and merges into main there (bit.cloud-side merges
+are allowed and expected), and the git repo's job is only to hold a
+reviewable, versioned copy of what's on main. Setting `lanes: []` disables
+lane-branch mirroring entirely — the only artifact this produces is the
+`mainSyncBranch` PR, which carries every exported change (and, per the
+one-sided `'theirs'` resolution described in *"Why the main-sync PR uses
+one-sided `'theirs'` resolution"* below, reverts any unexported git-side drift
+so the mirror stays honest).
+
+In this mode both triggers in `bit-sync.yml` still matter: the bit.cloud
+webhook still fires on every export to main (`laneId` empty &rarr;
+`bit ci sync --main`), so the mirror PR updates promptly after each export;
+the 30-minute `schedule` trigger is the backstop that keeps the mirror
+converged even if a webhook delivery is ever missed — since there's nothing
+lane-shaped to react to in this mode, the schedule trigger effectively
+becomes the primary, always-correct path rather than just a backstop.
+
+Fields (defaults shown are what apply when the field/block is omitted):
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `mode` | `'git-source-of-truth' \| 'mirror'` | `'git-source-of-truth'` | **Reserved** — see below. |
+| `branchPrefix` | `string` | `''` | Prepended to lane names to derive the mapped branch name. |
+| `branches` | `Record<string, string>` | `{}` | Explicit lane-name &rarr; branch-name overrides. |
+| `lanes` | `string[]` | `['*']` | Glob patterns of lane names to mirror; `[]` disables lane mirroring (main-only). |
+| `mainSyncBranch` | `string` | `'bit-sync/main'` | Branch used for main-scope drift sync PRs. |
+| `autoMergeMainSyncPr` | `boolean` | `false` | **Reserved** — see below. |
+
+### Reserved fields: `mode` and `autoMergeMainSyncPr`
+
+Both fields are accepted and validated, but **not implemented yet** — setting
+them changes nothing about the sync's behavior today, and each one logs a
+console warning rather than silently doing nothing:
+
+- `mode`: every run behaves as `'git-source-of-truth'` (git wins on conflict,
+  merges happen on the git host) regardless of what you set. Setting it to
+  `'mirror'` logs: *"sync.mode is set to "mirror", but mode is not
+  implemented yet — this run behaves as "git-source-of-truth" (git wins on
+  conflict, merges happen on the git host)"*.
+- `autoMergeMainSyncPr`: the main-sync PR is always opened without
+  auto-merge enabled. Setting it to `true` logs: *"sync.autoMergeMainSyncPr
+  is enabled in the config, but enabling auto-merge is not implemented yet —
+  the sync PR is opened without it. Use a repository auto-merge rule
+  instead."* Use a native GitHub branch/repository auto-merge rule on
+  `mainSyncBranch` if you want that behavior today.
+
+Treat both fields as forward-compat placeholders, not switches you can flip
+to change behavior.
+
+### Why the main-sync PR uses one-sided `'theirs'` resolution
+
+The `mainSyncBranch` PR checks the workspace out to the scope's latest
+exported versions using `theirs` merge resolution — deliberately, not as a
+simplification. A practical consequence: if a file in your repository has
+unexported git drift (changes made in git that were never `bit export`ed),
+that PR's diff will show those changes being **reverted**. This is visible
+and reviewable, not silent — reviewers who don't want that reversion should
+**close the PR** rather than merge it, at which point the drift remains as
+local git history until it's exported (or the sync branch catches up
+differently). Don't merge a main-sync PR you haven't read the diff of.
+
+## 5. Optional action inputs and environment variables
+
+Everything in this section is optional — the defaults are what both templates
+ship with, and each one appears as a commented-out line in the templates so you
+can uncomment rather than look up the spelling.
+
+| Name | Kind | Default | Purpose |
+| --- | --- | --- | --- |
+| `ws-dir` | action **input** (`with:`) | `.` | Directory of the Bit workspace, relative to the repository root. The action `chdir`s here before running any `git` or `bit` command. Set this when `workspace.jsonc` is not at the repository root (e.g. a monorepo with the workspace under `packages/my-workspace`). |
+| `main-sync-branch` | action **input** (`with:`) | `bit-sync/main` | Branch used for main-scope sync PRs. Must match `teambit.git/ci`.`sync.mainSyncBranch`. |
+| `GIT_USER_NAME` | **env** | `bit-sync[bot]` | `user.name` the action configures before committing. Every commit the sync creates is authored with this identity. |
+| `GIT_USER_EMAIL` | **env** | `bit-sync[bot]@users.noreply.github.com` | `user.email` the action configures before committing. |
+
+```yaml
+- uses: acme/bit-git-sync@v1 # CHANGE-ME: your published action location
+  with:
+    main-sync-branch: bit-sync/main
+    ws-dir: packages/my-workspace # only if workspace.jsonc is not at the repo root
+  env:
+    BIT_CONFIG_ACCESS_TOKEN: ${{ secrets.BIT_CONFIG_ACCESS_TOKEN }}
+    GITHUB_TOKEN: ${{ secrets.BIT_SYNC_GH_TOKEN || secrets.GITHUB_TOKEN }}
+    GIT_USER_NAME: my-release-bot
+    GIT_USER_EMAIL: releases@example.com
+```
+
+Override `GIT_USER_NAME`/`GIT_USER_EMAIL` when your repository has a rule that
+cares about commit authorship — a signed-commit or verified-email requirement,
+or a CODEOWNERS/audit convention that expects a specific bot identity. If you
+have no such rule, leave them unset: the `bit-sync[bot]` default makes
+sync-authored commits obvious in `git log`.
+
+## 6. Conflict resolution runbook
+
+When a lane sync can't be reconciled automatically (e.g. a manual edit
+conflicts with what the lane's export produced), the sync halts for that
+branch/PR instead of guessing:
+
+1. The PR is labeled **`bit-sync-conflict`**.
+2. A comment is posted on the PR with the resolution steps (verbatim):
+
+   ```text
+   bit-git-sync could not reconcile this branch automatically: <reason>
+
+   To resolve locally:
+     git fetch origin && git checkout <branch>
+     bit lane import <scope>/<lane>
+     # resolve conflicts, commit the result, then:
+     git push origin <branch>
+
+   Remove the `bit-sync-conflict` label to resume syncing.
+   ```
+
+3. **Syncing for that lane pauses** as long as the `bit-sync-conflict` label
+   is present — every subsequent sync run treats a labeled PR as a no-op and
+   will not re-attempt or overwrite your manual resolution.
+4. Once you've pushed a resolution and removed the label, the next sync run
+   (webhook, push, or the 30-minute scheduled reconcile) picks the branch up
+   normally again.
+
+## Reference: what's exported from this module
+
+- `TEMPLATE_FILES` — the template file names under `templates/`
+  (`['bit-sync.yml', 'bit-release.yml']`).
+- `REPOSITORY_DISPATCH_EVENT_TYPES` — the full accepted
+  `repository_dispatch` type set, kept in sync with
+  `@bitdev/git-sync.git-sync.event-router`'s router and with
+  `templates/bit-sync.yml`'s `on.repository_dispatch.types`.
+- `WEBHOOK_PAYLOAD_TEMPLATE` — the canonical bit.cloud webhook custom
+  payload template string documented in step 3 above.
