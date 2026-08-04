@@ -33,7 +33,7 @@ Every `CHANGE-ME` marker is one of these:
 | What | Where | Default shipped |
 | --- | --- | --- |
 | Your repository's **default branch** | `bit-sync.yml`'s `push.branches-ignore`, `bit-release.yml`'s `pull_request.branches` | `main` |
-| Where **you** publish this action | the `uses:` line in both templates | `acme/bit-git-sync@v1` (a placeholder pointing at this workspace's own repo path — **replace it**, and pin to a release tag or commit SHA) |
+| The action the workflow runs | the `uses:` line in both templates | `teambit/bit-git-sync@66c0fdf9e34e45f70b4f397b38b2b01f79dd1f41` — pinned, because the job holds write permission and a tag can move |
 | Your `sync.mainSyncBranch` | the `main-sync-branch` input in both templates, plus `bit-release.yml`'s `if:` guard | `bit-sync/main` |
 
 ## 2. Create the required secrets
@@ -44,7 +44,7 @@ credentials — see the note under the table.
 
 | Secret | Where it lives | Purpose |
 | --- | --- | --- |
-| `BIT_CONFIG_ACCESS_TOKEN` | GitHub repo secret | bit.cloud service-account token used to read/write the scope during sync. **In Mode A (the only implemented mode today, `git-source-of-truth`) this service account must be exempt from your org's change-request/merge block** — otherwise bit.cloud rejects the writes the sync makes on the account's behalf. |
+| `BIT_CONFIG_ACCESS_TOKEN` | GitHub repo secret | bit.cloud service-account token used to read/write the scope during sync. **The service account must be exempt from the change-request block of your organization** — otherwise bit.cloud rejects the writes the sync makes on the account's behalf. |
 | `BIT_SYNC_GH_TOKEN` | GitHub repo secret | A GitHub PAT or GitHub App installation token with `repo` scope, used by the workflow itself for `actions/checkout` and for the pushes the sync makes. **Pushes authenticated with the default `GITHUB_TOKEN` do not trigger other workflow runs** — if you need the sync PR's branch to run your own CI checks, you must push with a PAT/App token instead. Both templates fall back to `secrets.GITHUB_TOKEN` when this is unset, which is fine for checkout but will not re-trigger workflows on push. |
 | The webhook `Authorization` PAT | **bit.cloud webhook header** (step 3) — *not* a GitHub secret | A GitHub PAT that bit.cloud sends in the webhook's `Authorization: Bearer` header so its POST to the GitHub dispatches API is accepted. Needs only permission to create `repository_dispatch` events on the repo (`repo` scope on a classic PAT; `contents: write` on a fine-grained one). |
 
@@ -161,8 +161,6 @@ Add a `sync` block under the `teambit.git/ci` aspect in your `workspace.jsonc`:
 {
   "teambit.git/ci": {
     "sync": {
-      // Only implemented mode today; see "Reserved fields" below.
-      "mode": "git-source-of-truth",
       // Lane 'my-lane' maps to branch 'lane/my-lane'.
       "branchPrefix": "lane/",
       // Explicit lane -> branch overrides, applied after branchPrefix.
@@ -173,7 +171,14 @@ Add a `sync` block under the `teambit.git/ci` aspect in your `workspace.jsonc`:
       // Branch used for main-scope drift-reconcile PRs. Must match the `if:`
       // guard in bit-release.yml and the `main-sync-branch` action input in
       // both templates.
-      "mainSyncBranch": "bit-sync/main"
+      "mainSyncBranch": "bit-sync/main",
+      // How the main-scope difference reaches the default branch:
+      // "pr" opens a pull request; "direct-push" commits on the branch.
+      "mainSync": "pr",
+      // What the command does with one contested line: "halt" stops and
+      // labels the pull request; "git-wins" keeps the branch version;
+      // "lane-wins" takes the lane version.
+      "onConflict": "halt"
     }
   }
 }
@@ -189,9 +194,8 @@ git branch as it's edited.
 {
   "teambit.git/ci": {
     "sync": {
-      // NOTE: `mode` is a RESERVED no-op today -- what makes this "Mode B" is
-      // `lanes: []` below, not this line. See "Reserved fields" further down.
-      "mode": "git-source-of-truth",
+      // An empty `lanes` list is what makes this a mirror: the command
+      // reconciles the main scope only, and mirrors no lane to a branch.
       // No branchPrefix/branches needed -- lanes are never mirrored to branches.
       "lanes": [],
       "mainSyncBranch": "bit-sync/main"
@@ -222,24 +226,20 @@ Fields (defaults shown are what apply when the field/block is omitted):
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `mode` | `'git-source-of-truth' \| 'mirror'` | `'git-source-of-truth'` | **Reserved** — see below. |
+| `mainSync` | `'pr' \| 'direct-push'` | `'pr'` | How the main-scope difference reaches the default branch. With `pr`, the command opens a pull request. With `direct-push`, the command commits on the default branch. |
+| `onConflict` | `'halt' \| 'git-wins' \| 'lane-wins'` | `'halt'` | What the command does with one contested line. With `halt`, the command stops and labels the pull request. With `git-wins`, the command keeps the branch version. With `lane-wins`, the command takes the lane version. |
 | `branchPrefix` | `string` | `''` | Prepended to lane names to derive the mapped branch name. |
 | `branches` | `Record<string, string>` | `{}` | Explicit lane-name &rarr; branch-name overrides. |
 | `lanes` | `string[]` | `['*']` | Glob patterns of lane names to mirror; `[]` disables lane mirroring (main-only). |
 | `mainSyncBranch` | `string` | `'bit-sync/main'` | Branch used for main-scope drift sync PRs. |
 | `autoMergeMainSyncPr` | `boolean` | `false` | **Reserved** — see below. |
 
-### Reserved fields: `mode` and `autoMergeMainSyncPr`
+### Reserved field: `autoMergeMainSyncPr`
 
 Both fields are accepted and validated, but **not implemented yet** — setting
 them changes nothing about the sync's behavior today, and each one logs a
 console warning rather than silently doing nothing:
 
-- `mode`: every run behaves as `'git-source-of-truth'` (git wins on conflict,
-  merges happen on the git host) regardless of what you set. Setting it to
-  `'mirror'` logs: *"sync.mode is set to "mirror", but mode is not
-  implemented yet — this run behaves as "git-source-of-truth" (git wins on
-  conflict, merges happen on the git host)"*.
 - `autoMergeMainSyncPr`: the main-sync PR is always opened without
   auto-merge enabled. Setting it to `true` logs: *"sync.autoMergeMainSyncPr
   is enabled in the config, but enabling auto-merge is not implemented yet —
@@ -276,7 +276,7 @@ can uncomment rather than look up the spelling.
 | `GIT_USER_EMAIL` | **env** | `bit-sync[bot]@users.noreply.github.com` | `user.email` the action configures before committing. |
 
 ```yaml
-- uses: acme/bit-git-sync@v1 # CHANGE-ME: your published action location
+- uses: teambit/bit-git-sync@66c0fdf9e34e45f70b4f397b38b2b01f79dd1f41 # pinned: the job holds write permission
   with:
     main-sync-branch: bit-sync/main
     ws-dir: packages/my-workspace # only if workspace.jsonc is not at the repo root

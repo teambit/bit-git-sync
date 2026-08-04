@@ -34,7 +34,7 @@ describe('template YAML invariants', () => {
     // Each of these literals is an assumption about the customer's repo that
     // they must review. A literal without a nearby CHANGE-ME marker is a
     // silent footgun.
-    for (const literal of ['bit-sync/main', 'acme/bit-git-sync@v1']) {
+    for (const literal of ['bit-sync/main', 'teambit/bit-git-sync@66c0fdf9e34e45f70b4f397b38b2b01f79dd1f41']) {
       expect(text).toContain(literal);
     }
     expect(text).toContain('CHANGE-ME');
