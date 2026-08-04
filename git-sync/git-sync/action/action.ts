@@ -189,5 +189,16 @@ export async function runAction(deps: ActionDeps): Promise<number> {
   await exec('git', ['config', 'user.name', gitUserName]);
   await exec('git', ['config', 'user.email', gitUserEmail]);
 
+  // `bit ci sync` is newer than the `bit ci pr` / `bit ci merge` commands, so a
+  // released bit can route here and then fail with "unknown command". Probe the
+  // subcommand first and name the requirement instead.
+  if (routed.args[0] === 'sync' && (await exec('bit', ['ci', 'sync', '--help'])) !== 0) {
+    console.error(
+      '[bit-git-sync] this bit version has no "bit ci sync" command. Install a bit version that ' +
+        'includes it (see the README prerequisites), then run the workflow again.'
+    );
+    return 1;
+  }
+
   return exec('bit', ['ci', ...routed.args, '--log', 'info']);
 }

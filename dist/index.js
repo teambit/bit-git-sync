@@ -196,6 +196,12 @@ async function runAction(deps) {
   const gitUserEmail = env.GIT_USER_EMAIL || DEFAULT_GIT_USER_EMAIL;
   await exec2("git", ["config", "user.name", gitUserName]);
   await exec2("git", ["config", "user.email", gitUserEmail]);
+  if (routed.args[0] === "sync" && await exec2("bit", ["ci", "sync", "--help"]) !== 0) {
+    console.error(
+      '[bit-git-sync] this bit version has no "bit ci sync" command. Install a bit version that includes it (see the README prerequisites), then run the workflow again.'
+    );
+    return 1;
+  }
   return exec2("bit", ["ci", ...routed.args, "--log", "info"]);
 }
 

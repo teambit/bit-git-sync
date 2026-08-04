@@ -12,8 +12,32 @@ One repository maps to one scope. A change can start on either side:
 | A person merges the pull request | The action merges the lane, then tags and exports the versions. |
 | A person opens an ordinary git pull request | The action adopts the pull request into a lane. |
 
-The action needs `bit ci sync`, which is part of Bit. See
-[teambit/bit#10541](https://github.com/teambit/bit/pull/10541).
+## Prerequisite: a bit version that has `bit ci sync`
+
+The `bit ci pr` and `bit ci merge` commands are in every current release. The `bit ci sync` command
+is not: it arrives with [teambit/bit#10541](https://github.com/teambit/bit/pull/10541). Bit 2.0.63
+does not have the command.
+
+If the workflow runs a sync on a bit version without the command, the action stops and names the
+requirement. It does not fail with an unclear error.
+
+Until the pull request is in a release, install a build that contains it, and tell
+`bit-tasks/init` to skip its own installation:
+
+```yaml
+      - name: Install a bit version with bit ci sync
+        run: |
+          npm i -g @teambit/bvm
+          # A snap build of the merge commit, or the first release after it.
+          bvm install <version>
+          echo "$HOME/bin" >> $GITHUB_PATH
+      - uses: bit-tasks/init@v2
+        with:
+          skip-bit-install: 'true'
+```
+
+`npm view @teambit/bit dist-tags` lists the available channels. The `snap` tag holds a build for a
+single commit.
 
 ## Use the action
 

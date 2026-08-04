@@ -40,13 +40,18 @@ describe('runAction', () => {
     const exitCode = await runAction({
       env,
       readEventFile: () => event,
-      exec: fakeExec(calls, 7),
+      // the availability probe succeeds; the real command exits 7, and that is the code the action returns
+      exec: async (cmd: string, args: string[]) => {
+        calls.push({ cmd, args });
+        return args.includes('--help') ? 0 : 7;
+      },
     });
 
     expect(exitCode).toBe(7);
     expect(calls).toEqual([
       { cmd: 'git', args: ['config', 'user.name', 'bit-sync[bot]'] },
       { cmd: 'git', args: ['config', 'user.email', 'bit-sync[bot]@users.noreply.github.com'] },
+      { cmd: 'bit', args: ['ci', 'sync', '--help'] },
       { cmd: 'bit', args: ['ci', 'sync', 'org.scope/feature-x', '--log', 'info'] },
     ]);
   });
@@ -84,7 +89,7 @@ describe('runAction', () => {
 
     expect(calls[0]).toEqual({ cmd: 'git', args: ['config', 'user.name', 'custom-bot'] });
     expect(calls[1]).toEqual({ cmd: 'git', args: ['config', 'user.email', 'custom-bot@example.com'] });
-    expect(calls[2]).toEqual({ cmd: 'bit', args: ['ci', 'sync', 'feature-x', '--log', 'info'] });
+    expect(calls[calls.length - 1]).toEqual({ cmd: 'bit', args: ['ci', 'sync', 'feature-x', '--log', 'info'] });
   });
 
   it('reads the event payload from GITHUB_EVENT_PATH', async () => {
@@ -493,4 +498,45 @@ describe('dist/index.js (committed action bundle)', () => {
     expect(output).toContain('[bit-git-sync] skipping');
     expect(code).toBe(0);
   }, 30_000);
+
+  /**
+   * `bit ci sync` is newer than `bit ci pr` / `bit ci merge`, so a released bit can route here and
+   * fail with "unknown command". The probe turns that into a named requirement.
+   */
+  it('refuses to run a sync when this bit has no "bit ci sync", and never runs the real command', async () => {
+    const calls: Call[] = [];
+    const code = await runAction({
+      env: { GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_EVENT_PATH: '/tmp/event.json' },
+      readEventFile: () => ({ inputs: { lane: 'feature-x' }, repository: { default_branch: 'main' } }),
+      chdir: () => {},
+      // the probe fails; every other command succeeds
+      exec: async (cmd: string, args: string[]) => {
+        calls.push({ cmd, args });
+        return args[1] === 'sync' && args[2] === '--help' ? 1 : 0;
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(calls.filter((call) => call.cmd === 'bit')).toEqual([{ cmd: 'bit', args: ['ci', 'sync', '--help'] }]);
+  });
+
+  it('does not probe for a merge, which every released bit already has', async () => {
+    const calls: Call[] = [];
+    await runAction({
+      env: { GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: '/tmp/event.json' },
+      readEventFile: () => ({
+        action: 'closed',
+        pull_request: { merged: true, head: { ref: 'feature-x' }, base: { ref: 'main' } },
+        repository: { default_branch: 'main' },
+      }),
+      ...fakeOps([] as Op[]),
+      exec: async (cmd: string, args: string[]) => {
+        calls.push({ cmd, args });
+        return 0;
+      },
+    });
+
+    expect(calls.some((call) => call.args.includes('--help'))).toBe(false);
+    expect(calls[calls.length - 1]).toEqual({ cmd: 'bit', args: ['ci', 'merge', '--log', 'info'] });
+  });
 });
