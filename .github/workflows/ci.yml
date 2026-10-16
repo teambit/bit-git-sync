@@ -1,0 +1,30 @@
+# CI for the action itself: unit tests for the components, and a check that the
+# committed bundle (dist/index.js, which action.yml runs verbatim) is fresh and
+# loads under Node.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install bit
+        run: |
+          npx --yes @teambit/bvm install 2.2.115
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: bit install
+      - name: Test
+        run: bit test
+      - name: Verify the committed bundle
+        run: node scripts/verify-bundle.mjs
