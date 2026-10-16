@@ -19,7 +19,7 @@ inputs:
     required: false
     default: bit-sync/main
 runs:
-  using: node20
+  using: node24
   # Committed esbuild bundle -- see scripts/bundle-action.mjs. Must be ESM
   # (the root package.json is `"type": "module"`); `npm run verify-bundle`
   # asserts it is both fresh and loadable.

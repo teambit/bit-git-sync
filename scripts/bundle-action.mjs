@@ -27,7 +27,7 @@ export const bundleOptions = {
   entryPoints: [join(repoRoot, 'git-sync/git-sync/action/run.ts')],
   bundle: true,
   platform: 'node',
-  target: 'node20',
+  target: 'node24',
   format: 'esm',
   absWorkingDir: repoRoot,
 };

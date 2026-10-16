@@ -45,7 +45,7 @@ function scopesInComponentIds(componentIds) {
 function isLaneRelevantToScope(componentIds, repoScope) {
   if (!componentIds || !repoScope)
     return true;
-  const scopes = scopesInComponentIds(componentIds);
+  const scopes = scopesInComponentIds(Array.isArray(componentIds) ? componentIds.join(",") : String(componentIds));
   if (scopes.length === 0)
     return true;
   return scopes.includes(repoScope);
