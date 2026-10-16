@@ -72,6 +72,33 @@ describe('routeEvent', () => {
       });
     });
 
+    it('accepts componentIds as an array (API-created webhooks, hand-rolled dispatches)', () => {
+      expect(
+        routeEvent({
+          ...base,
+          eventName: 'repository_dispatch',
+          dispatchType: 'bit-export',
+          repoScope: 'acme.cards',
+          clientPayload: {
+            laneId: 'acme.cards/cross-scope',
+            componentIds: ['acme.shop/bar@2.0.0', 'acme.cards/foo@1.0.0'],
+          },
+        })
+      ).toEqual({ kind: 'run', args: ['sync', 'acme.cards/cross-scope'] });
+    });
+
+    it('treats an empty componentIds array as absent (fails open)', () => {
+      expect(
+        routeEvent({
+          ...base,
+          eventName: 'repository_dispatch',
+          dispatchType: 'bit-export',
+          repoScope: 'acme.cards',
+          clientPayload: { laneId: '', componentIds: [] },
+        })
+      ).toEqual({ kind: 'run', args: ['sync', '--main'] });
+    });
+
     it('fails open (routes) when componentIds is absent, even with repoScope set', () => {
       expect(
         routeEvent({

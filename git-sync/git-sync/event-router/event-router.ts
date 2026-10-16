@@ -28,9 +28,10 @@ export type RouterInput = {
      * cross-scope-lane relevance filter (see `repoScope` below) to decide
      * whether this repo has any stake in a lane export before routing it.
      * Absent/empty is NOT a signal of anything — it just means the filter
-     * can't run, so it fails open (see `isLaneRelevantToScope`).
+     * can't run, so it fails open (see `isLaneRelevantToScope`). A webhook
+     * created through the API, or a hand-rolled dispatch, may send an array.
      */
-    componentIds?: string;
+    componentIds?: string | string[];
   };
   /** push: refs/heads/<branch>. */
   ref?: string;
@@ -179,9 +180,9 @@ function scopesInComponentIds(componentIds: string): string[] {
  * whose content isn't entirely inside `defaultScope`, so failing open here
  * only means the halt happens in `bit ci` instead of being pre-empted here.
  */
-function isLaneRelevantToScope(componentIds: string | undefined, repoScope: string | undefined): boolean {
+function isLaneRelevantToScope(componentIds: string | string[] | undefined, repoScope: string | undefined): boolean {
   if (!componentIds || !repoScope) return true;
-  const scopes = scopesInComponentIds(componentIds);
+  const scopes = scopesInComponentIds(Array.isArray(componentIds) ? componentIds.join(',') : String(componentIds));
   if (scopes.length === 0) return true;
   return scopes.includes(repoScope);
 }
